@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-
-"""LDAP group cleaner"""
+# -*- coding: UTF-8 -*-
+# pylint: disable=invalid-name
 
 # Copyright:
-#   2019 P. H. <github.com/perfide>
+#   2020 P. H. <github.com/perfide>
 # License:
 #   BSD-2-Clause (BSD 2-Clause "Simplified" License)
 #   https://spdx.org/licenses/BSD-2-Clause.html
+
+"""LDAP group cleaner"""
 
 # included
 import argparse
@@ -21,24 +23,27 @@ import tty
 import ldap3  # pip3 install ldap3 / sudo apt-get install python3-ldap3
 import yaml  # pip3 install PyYAML / sudo apt-get install python3-yaml
 
-
 DUMMY_USER = 'cn=delme'
 
 LOG = logging.getLogger('px-ldap-group-cleanup')
-LOG.setLevel(logging.INFO)
+LOG.setLevel(logging.DEBUG)
 LOG_HANDLER = logging.StreamHandler()
-LOG_HANDLER.setLevel(logging.INFO)
+LOG_HANDLER.setLevel(logging.DEBUG)
 LOG.addHandler(LOG_HANDLER)
 
 
 class BadNoneValue(Exception):
     """Raise an error if an argument is None"""
     def __init__(self, argument):
+        Exception.__init__(self)
         self.argument = argument
 
     def __str__(self):
         return 'argument {}: can not be None'.format(self.argument)
-# end class BadNoneValue
+
+
+class LdapOperationFailed(Exception):
+    """Exception raised if an LDAP operation failed"""
 
 
 def getc():
@@ -51,15 +56,14 @@ def getc():
         str: a single character
 
     """
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
+    file_descriptor = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(file_descriptor)
     try:
         tty.setraw(sys.stdin.fileno())
-        ch = sys.stdin.read(1)
+        char = sys.stdin.read(1)
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    return ch
-# end def getc
+        termios.tcsetattr(file_descriptor, termios.TCSADRAIN, old_settings)
+    return char
 
 
 def force_getc(opts):
@@ -77,19 +81,20 @@ def force_getc(opts):
         print(' [{}] {}'.format(key, desc), end='')
     print('')
     while True:
-        c = getc()
-        if c == '\x03':
+        char = getc()
+        if char == '\x03':
             # ctrl+c
             raise KeyboardInterrupt
-        if c in opts:
-            return c
-        print('you pressed {!r} which is not in [{}]'.format(
-            c,
-            ' '.join(opts.keys()),
-        ))
+        if char in opts:
+            return char
+        print(
+            'you pressed {!r} which is not in [{}]'.format(
+                char,
+                ' '.join(opts.keys()),
+            )
+        )
     # never reached
-    return
-# end def force_getc
+    return ''
 
 
 def get_user_feedback():
@@ -109,16 +114,15 @@ def get_user_feedback():
         'a': 'yes to all',
         'q': 'no to all',
     }
-    c = force_getc(opts)
-    if c == 'y':
+    char = force_getc(opts)
+    if char == 'y':
         modify_group = True
-    if c == 'a':
+    if char == 'a':
         ask_user = False
         modify_group = True
-    if c == 'q':
+    if char == 'q':
         ask_user = False
     return (ask_user, modify_group)
-# end def get_user_feedback
 
 
 def handle_group(conn, entry, user_dns, ask_user, modify_group):
@@ -137,12 +141,15 @@ def handle_group(conn, entry, user_dns, ask_user, modify_group):
     """
     LOG.info('dn: "{}"'.format(entry['dn']))
     LOG.info('cn: "{}"'.format('~'.join(entry['attributes']['cn'])))
-    LOG.info('description: "{}"'.format(
-        '~'.join(entry['attributes']['description'])))
-    unique_members = set(
-        [member.lower() for member in entry['attributes']['uniqueMember']])
+    LOG.info(
+        'description: "{}"'.format(
+            '~'.join(entry['attributes']['description'])
+        )
+    )
+    mixed_unique_members = entry['attributes']['uniqueMember']
+    unique_members = {member.lower() for member in mixed_unique_members}
     keep_members = unique_members & user_dns
-    remove_members = unique_members - user_dns
+    remove_members = sorted(unique_members - user_dns)
     LOG.info('count all: {}'.format(len(unique_members)))
     LOG.info('count keep: {}'.format(len(keep_members)))
     LOG.info('count remove: {}'.format(len(remove_members)))
@@ -158,29 +165,36 @@ def handle_group(conn, entry, user_dns, ask_user, modify_group):
                 LOG.info('adding a dummy...')
                 conn.modify(
                     entry['dn'],
-                    {'uniqueMember': [(ldap3.MODIFY_ADD, [DUMMY_USER])]})
+                    {'uniqueMember': [(ldap3.MODIFY_ADD, [DUMMY_USER])]},
+                )
                 if conn.result['result'] == 0:
                     LOG.info('success')
                 else:
-                    LOG.info('modification failed: {} ({})'.format(
-                        conn.result['description'], conn.result['result']))
+                    LOG.info(
+                        'modification failed: {} ({})'.format(
+                            conn.result['description'], conn.result['result']
+                        )
+                    )
                     LOG.info(conn.result)
 
             LOG.info('removing...')
             conn.modify(
                 entry['dn'],
-                {'uniqueMember': [(ldap3.MODIFY_DELETE, remove_members)]})
+                {'uniqueMember': [(ldap3.MODIFY_DELETE, remove_members)]},
+            )
             if conn.result['result'] == 0:
                 LOG.info('success')
             else:
-                LOG.info('modification failed: {} ({})'.format(
-                    conn.result['description'], conn.result['result']))
+                LOG.info(
+                    'modification failed: {} ({})'.format(
+                        conn.result['description'], conn.result['result']
+                    )
+                )
                 LOG.info(conn.result)
 
         else:
             LOG.info('skipping...')
     return (ask_user, modify_group)
-# end def handle_group
 
 
 def get_user_dns(conn, search_base):
@@ -196,19 +210,31 @@ def get_user_dns(conn, search_base):
     """
     user_dns = set()
     LOG.info('searching for inetOrgPerson')
-    search_result = conn.search(
-        search_base=search_base,
-        search_filter='(objectclass=inetOrgPerson)',
-        search_scope=ldap3.SUBTREE,
-        attributes=[])
-    if not search_result:
-        LOG.error('user-search failed')
+    try:
+        search_result = conn.search(
+            search_base=search_base,
+            search_filter='(objectclass=inetOrgPerson)',
+            search_scope=ldap3.SUBTREE,
+            attributes=[],
+            time_limit=1,
+        )
+    except ldap3.core.exceptions.LDAPSocketReceiveError as err:
+        # error receiving data: The read operation timed out
+        LOG.error('timeout while searching for users: {}'.format(err))
         return user_dns
+    if not search_result or conn.result['result'] != 0:
+        raise LdapOperationFailed(f'user-search failed: {conn.result}')
+    assert conn.result['description'] == 'success'
+    assert conn.result['dn'] == ''
+    assert conn.result['message'] == ''
+    assert conn.result['referrals'] is None
+    assert conn.result['type'] == 'searchResDone'
     LOG.info('search-results: {}'.format(len(conn.response)))
     for entry in conn.response:
-        user_dns.add(entry['dn'].lower())
+        distingished_name = entry['dn'].lower()
+        LOG.info("- {}".format(distingished_name))
+        user_dns.add(distingished_name)
     return user_dns
-# end def get_user_dns
 
 
 def prepare_parameters(arguments):
@@ -222,10 +248,11 @@ def prepare_parameters(arguments):
 
     """
     config_path = os.path.join(
-        os.path.expanduser('~'), '.config', 'px-ldap-group-cleanup.yaml')
+        os.path.expanduser('~'), '.config', 'px-ldap-group-cleanup.yaml'
+    )
     try:
-        with open(config_path) as fh:
-            cfg = yaml.safe_load(fh)
+        with open(config_path) as file_handler:
+            cfg = yaml.safe_load(file_handler)
     except FileNotFoundError:
         LOG.warning('config not found at: {}'.format(config_path))
         cfg = {}
@@ -234,19 +261,12 @@ def prepare_parameters(arguments):
         cfg = {}
 
     parser = argparse.ArgumentParser(
-        description='Use a yaml-config to render Jinja2 templates')
-    parser.add_argument(
-        '-H', '--host',
-        help='Domain Name, IP or LDAP-URL')
-    parser.add_argument(
-        '-D', '--bind-dn',
-        help='users distingushed name')
-    parser.add_argument(
-        '-w', '--bind-pw',
-        help='users password')
-    parser.add_argument(
-        '-b', '--search-base',
-        help='base-dn for searches')
+        description='Use a yaml-config to render Jinja2 templates'
+    )
+    parser.add_argument('-H', '--host', help='Domain Name, IP or LDAP-URL')
+    parser.add_argument('-D', '--bind-dn', help='users distingushed name')
+    parser.add_argument('-w', '--bind-pw', help='users password')
+    parser.add_argument('-b', '--search-base', help='base-dn for searches')
     parser.set_defaults(**cfg)
     namespace = parser.parse_args(arguments)
 
@@ -262,7 +282,6 @@ def prepare_parameters(arguments):
         parser.print_usage()
         raise BadNoneValue('-b/--search-base')
     return vars(namespace)
-# end def prepare_parameters
 
 
 def main(arguments):
@@ -279,35 +298,44 @@ def main(arguments):
     modify_group = False
     parameters = prepare_parameters(arguments)
 
+    LOG.debug('creating server')
     server = ldap3.Server(parameters['host'], get_info=ldap3.ALL)
+    LOG.debug('creating connection')
     conn = ldap3.Connection(
         server,
         user=parameters['bind_dn'],
         password=parameters['bind_pw'],
         auto_bind=False,
-        receive_timeout=2)
-
+        receive_timeout=2,
+    )
+    LOG.debug('starting TLS')
     try:
         start_tls_result = conn.start_tls()
-    except ldap3.core.exceptions.LDAPSocketOpenError as e:
-        LOG.error('failed to open socket: {}'.format(e))
+    except ldap3.core.exceptions.LDAPSocketOpenError as err:
+        LOG.error('failed to open socket: {}'.format(err))
         return 1
-    except ldap3.core.exceptions.LDAPStartTLSError as e:
+    except ldap3.core.exceptions.LDAPStartTLSError as err:
         # wrap socket error: _ssl.c:835: The handshake operation timed out
-        LOG.error('failed to start TLS: {}'.format(e))
+        LOG.error('failed to start TLS: {}'.format(err))
         return 1
-    except ldap3.core.exceptions.LDAPSocketReceiveError as e:
+    except ldap3.core.exceptions.LDAPSocketReceiveError as err:
         # error receiving data: timed out
-        LOG.error('timeout while connecting: {}'.format(e))
+        LOG.error('timeout while connecting: {}'.format(err))
         return 1
     assert start_tls_result is True
-    LOG.debug('start_tls succeeded')
-    bind_result = conn.bind()
+    LOG.debug('authenticating')
+    try:
+        bind_result = conn.bind()
+    except ldap3.core.exceptions.LDAPSocketReceiveError as err:
+        # error receiving data: The read operation timed out
+        LOG.error('timeout while binding: {}'.format(err))
+        return 1
     if not bind_result:
         LOG.error('bind failed')
         return 2
-    LOG.debug('bind succeeded')
+    LOG.debug('fetching users')
     user_dns = get_user_dns(conn, parameters['search_base'])
+    LOG.debug('found {} users'.format(len(user_dns)))
     # Keep the dummy-user
     user_dns.add(DUMMY_USER)
     LOG.info('searching for groupOfUniqueNames')
@@ -315,16 +343,21 @@ def main(arguments):
         search_base=parameters['search_base'],
         search_filter='(objectclass=groupOfUniqueNames)',
         search_scope=ldap3.SUBTREE,
-        attributes=['cn', 'uniqueMember', 'description'])
+        attributes=['cn', 'uniqueMember', 'description'],
+    )
     LOG.info('search_result {} ({})'.format(search_result, len(conn.response)))
     LOG.info('')
 
     for entry in conn.response:
         (ask_user, modify_group) = handle_group(
-            conn, entry, user_dns, ask_user, modify_group)
+            conn,
+            entry,
+            user_dns,
+            ask_user,
+            modify_group,
+        )
         LOG.info('')
     return 0
-# def end main
 
 
 if __name__ == '__main__':
@@ -332,7 +365,7 @@ if __name__ == '__main__':
         sys.exit(main(sys.argv[1:]))
     except KeyboardInterrupt:
         LOG.error('\ninterrupted by keyboard')
-    except BadNoneValue as e:
-        LOG.error("{}: error: {}".format(sys.argv[0], e))
+    except BadNoneValue as err:
+        LOG.error("{}: error: {}".format(sys.argv[0], err))
 
 # [EOF]
